@@ -25,6 +25,18 @@ CAPTION = re.compile(r'^(equity|credit) setting, (variance reduced|fully realise
 ROW = re.compile(r'^\| *`([a-zA-Z_0-9]+)`')
 PROBLEMS: list[str] = []
 
+# Template tokens. NAMED are matched anywhere in the file, because they should never appear at
+# all once the section has been rendered. The generic pattern catches any other all capitals
+# token with an underscore that is long enough to be a template name, and it is applied to the
+# prose only: code blocks legitimately contain things such as QUEUE_SIZE or f(d) expressions.
+# The length floor of six keeps short notation out of the way, for example J_RL.
+NAMED_TOKENS = ('PARAMETER_TABLE', 'CREDIT_NOTE', 'FILLS_CREDIT', 'RUNTIME', 'N_MIN_SUITE',
+                'N_TESTS', 'BUDGET')
+PREFIX_TOKENS = ('HEADLINE_', 'TABLE_', 'BOUND_COST_')
+GENERIC_TOKEN = re.compile(r'\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b')
+GENERIC_MIN_LENGTH = 6
+HEADLINE_PREFIX = {'equity': 'Equity: ', 'credit': 'Credit: '}
+
 
 def check(label: str, printed: float, expected: float, decimals: int) -> None:
     if round(printed, decimals) != round(float(expected), decimals):
@@ -34,6 +46,60 @@ def check(label: str, printed: float, expected: float, decimals: int) -> None:
 
 def close(a: float, b: float, tol: float) -> bool:
     return abs(float(a) - float(b)) <= tol
+
+
+def strip_code_blocks(lines: list[str]) -> list[tuple[int, str]]:
+    """The lines that are prose, with their original line numbers."""
+    prose = []
+    in_block = False
+    for number, line in enumerate(lines, 1):
+        if line.strip().startswith('```'):
+            in_block = not in_block
+            continue
+        if not in_block:
+            prose.append((number, line))
+    return prose
+
+
+def placeholder_tokens(line: str) -> set[str]:
+    """Template tokens on a prose line, deduplicated."""
+    found = set()
+    for token in NAMED_TOKENS:
+        if token in line:
+            found.add(token)
+    for prefix in PREFIX_TOKENS:
+        index = line.find(prefix)
+        while index != -1:
+            end = index + len(prefix)
+            while end < len(line) and (line[end].isupper() or line[end].isdigit()
+                                       or line[end] == '_'):
+                end += 1
+            found.add(line[index:end])
+            index = line.find(prefix, index + 1)
+    for match in GENERIC_TOKEN.finditer(line):
+        if len(match.group()) >= GENERIC_MIN_LENGTH:
+            found.add(match.group())
+    return found
+
+
+def check_placeholders(lines: list[str]) -> int:
+    """Fail if the README still contains an unfilled template token.
+
+    Returns the number of prose lines scanned, which is reported separately from the count of
+    numbers checked against the results.
+    """
+    found = set()
+    for number, line in enumerate(lines, 1):
+        for token in NAMED_TOKENS:
+            if token in line:
+                found.add((number, token))
+    prose = strip_code_blocks(lines)
+    for number, line in prose:
+        for token in placeholder_tokens(line):
+            found.add((number, token))
+    for number, token in sorted(found):
+        PROBLEMS.append(f'README line {number}: unfilled template token {token!r}')
+    return len(prose)
 
 
 def parse_results_tables(lines: list[str], summaries: dict) -> int:
@@ -105,7 +171,8 @@ def parse_headlines(text: str, summaries: dict) -> int:
         if dispersion is None:
             PROBLEMS.append(f'{setting}: summary.json has no seed dispersion to check against')
             continue
-        expected = (f"PPO recovers {100 * dispersion['mean_efficiency']:.1f}% "
+        expected = (f"{HEADLINE_PREFIX[setting]}PPO recovers "
+                    f"{100 * dispersion['mean_efficiency']:.1f}% "
                     f"+/- {100 * dispersion['std_efficiency']:.1f}% (worst seed "
                     f"{100 * dispersion['worst_seed_efficiency']:.1f}%)")
         if expected not in text:
@@ -160,6 +227,7 @@ def main() -> int:
     text = README.read_text()
     lines = text.splitlines()
 
+    prose_lines = check_placeholders(lines)
     checks = parse_results_tables(lines, summaries)
     checks += parse_headlines(text, summaries)
     checks += parse_calibration(text, summaries)
@@ -169,7 +237,8 @@ def main() -> int:
         for problem in PROBLEMS:
             print(f'  - {problem}')
         return 1
-    print(f'README.md matches summary.json on all {checks} checked numbers')
+    print(f'README.md matches summary.json on all {checks} checked numbers, and no unfilled '
+          f'template token was found in {prose_lines} prose lines')
     return 0
 
 
